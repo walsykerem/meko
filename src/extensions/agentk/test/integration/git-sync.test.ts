@@ -267,9 +267,11 @@ describe('changes vs. the base (real git)', () => {
 
   it('serves both sides of a changed image, and only images inside the repo', async () => {
     const png = (n: number) => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, n]);
+    const svg = (fill: string) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg"><rect fill="${fill}"/></svg>\n`);
     mkdirSync(join(repo, 'img'));
     writeFileSync(join(repo, 'img', 'logo.png'), png(1));
     writeFileSync(join(repo, 'img', 'gone.png'), png(2));
+    writeFileSync(join(repo, 'img', 'icon.svg'), svg('red'));
     git(repo, 'add', '.');
     git(repo, 'commit', '-q', '-m', 'images');
     rmSync(wt, { recursive: true, force: true });
@@ -279,6 +281,7 @@ describe('changes vs. the base (real git)', () => {
     writeFileSync(join(wt, 'img', 'logo.png'), png(9)); // uncommitted edit
     unlinkSync(join(wt, 'img', 'gone.png'));
     writeFileSync(join(wt, 'new.png'), png(5)); // untracked
+    writeFileSync(join(wt, 'img', 'icon.svg'), svg('blue')); // text, served as an image
 
     expect(await changedImage(wt, 'main', 'img/logo.png', 'old')).toEqual({ type: 'image/png', data: png(1) });
     expect(await changedImage(wt, 'main', 'img/logo.png', 'new')).toEqual({ type: 'image/png', data: png(9) });
@@ -286,6 +289,8 @@ describe('changes vs. the base (real git)', () => {
     expect((await changedImage(wt, 'main', 'new.png', 'new'))?.data).toEqual(png(5));
     expect(await changedImage(wt, 'main', 'img/gone.png', 'new')).toBeNull();
     expect((await changedImage(wt, 'main', 'img/gone.png', 'old'))?.data).toEqual(png(2));
+    expect(await changedImage(wt, 'main', 'img/icon.svg', 'old')).toEqual({ type: 'image/svg+xml', data: svg('red') });
+    expect(await changedImage(wt, 'main', 'img/icon.svg', 'new')).toEqual({ type: 'image/svg+xml', data: svg('blue') });
     const c = (await changes(wt, 'main'))!;
     expect(c.files.find((f) => f.path === 'img/logo.png')).toMatchObject({ binary: true, patch: null });
 
@@ -300,6 +305,7 @@ describe('changes vs. the base (real git)', () => {
     expect((await changedImage(wt, 'main', 'new.png', 'new', sha))?.data).toEqual(png(5));
     expect(await changedImage(wt, 'main', 'img/gone.png', 'new', sha)).toBeNull();
     expect((await changedImage(wt, 'main', 'img/gone.png', 'old', sha))?.data).toEqual(png(2));
+    expect((await changedImage(wt, 'main', 'img/icon.svg', 'new', sha))?.data).toEqual(svg('blue'));
     await expect(changedImage(wt, 'main', 'img/logo.png', 'old', git(wt, 'rev-parse', 'main'))).rejects.toBeInstanceOf(UnknownCommitError);
 
     // Never a non-image, a path out of the repo, or a symlink that leads out of it.
@@ -308,6 +314,42 @@ describe('changes vs. the base (real git)', () => {
     for (const [path, side] of [['README.md', 'new'], ['../secret.png', 'new'], ['img/../../secret.png', 'old'], [join(home, 'secret.png'), 'new'], ['link.png', 'new']] as const) {
       await expect(changedImage(wt, 'main', path, side), `${path} (${side})`).rejects.toThrow(/not a previewable image/);
     }
+  });
+
+  it('lists SVGs as text, and untracked images as binary without reading them', async () => {
+    const svg = (fill: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="${fill}"/></svg>\n`;
+    writeFileSync(join(wt, 'logo.svg'), svg('red'));
+    git(wt, 'add', '-A');
+    git(wt, 'commit', '-q', '-m', 'logo');
+    writeFileSync(join(wt, 'logo.svg'), svg('blue'));
+    writeFileSync(join(wt, 'new.svg'), svg('green'));
+    // Past the 1 MB a text file is read up to: an image all the same.
+    writeFileSync(join(wt, 'big.png'), Buffer.alloc(2 * 1024 * 1024, 7));
+    // No NUL in it, but named as an image: binary, not text.
+    writeFileSync(join(wt, 'plain.jpg'), 'not really a jpeg');
+
+    const c = (await changes(wt, 'main'))!;
+    const by = Object.fromEntries(c.files.map((f) => [f.path, f]));
+    // An SVG is text: its diff and line counts, and a preview beside them.
+    expect(by['logo.svg']).toMatchObject({ kind: 'added', binary: false, added: 1, uncommitted: true });
+    expect(by['logo.svg'].patch).toContain('+<svg');
+    expect(by['new.svg']).toMatchObject({ kind: 'untracked', binary: false, added: 1, patch: `@@ -0,0 +1,1 @@\n+${svg('green').trimEnd()}` });
+    expect(by['big.png']).toMatchObject({ kind: 'untracked', binary: true, patch: null, added: 0 });
+    expect(by['plain.jpg']).toMatchObject({ kind: 'untracked', binary: true, patch: null, added: 0 });
+    expect(c.omittedPatches).toBe(0);
+  });
+
+  it('keeps the untracked read budget for text: images past it are still binary, and text under it still gets its patch', async () => {
+    // 36 MB of untracked images, each under the 1 MB a file is read up to but more than the 32 MB
+    // read budget in all, listed before the text file.
+    const n = 40;
+    for (let i = 0; i < n; i++) writeFileSync(join(wt, `a${String(i).padStart(2, '0')}.png`), Buffer.alloc(900 * 1024));
+    writeFileSync(join(wt, 'z.txt'), 'hello\n');
+    const c = (await changes(wt, 'main'))!;
+    const by = Object.fromEntries(c.files.map((f) => [f.path, f]));
+    for (let i = 0; i < n; i++) expect(by[`a${String(i).padStart(2, '0')}.png`]).toMatchObject({ binary: true, patch: null });
+    expect(by['z.txt']).toMatchObject({ added: 1, patch: '@@ -0,0 +1,1 @@\n+hello' });
+    expect(c.omittedPatches).toBe(0);
   });
 
   it("serves a changed file's new side as text, with the patch changes() gives it, and only changed text files in the repo", async () => {
