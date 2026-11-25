@@ -4882,6 +4882,9 @@ div[id^='dak-mermaid-'] .label {
   margin: 0;
 }
 .cmt {
+  /* A grid item is at least as wide as its content by default: a suggestion's long line (.cmt-sugg-ln)
+     would widen the card past its thread and push Apply, Edit and Delete off its edge. */
+  min-width: 0;
   background: var(--surface);
   border: 1px solid var(--rule);
   border-radius: 6px;
@@ -4907,6 +4910,12 @@ div[id^='dak-mermaid-'] .label {
 }
 .cmt-meta .link-btn {
   font-size: 11.5px;
+}
+/* Where a comment is: a long file path breaks anywhere, as .chg-file-path does, rather than running
+   past the card, which no longer widens to its content (.cmt's min-width: 0). */
+.cmt-where {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .cmt-state {
   font: 600 10px/1.6 var(--mono);
